@@ -40,10 +40,12 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 	private static final String ORDERPARAM_TRADERID = "M2";
 	private static final String ORDERPARAM_ACCOUNT = "AC";
 	private static final String SELSYMBOL_PARAMETER = "selsymbol";
+	private static final String DELAY_PARAMETER	= "Delay";
 	private static final int 	OrderMode_Batch 	= 1;
 	private static final int 	OrderMode_Series 	= 2;
 	private static final int 	OrderSide_Bid 	= 1;
 	private static final int 	OrderSide_Ask 	= 2;
+	private static final String VERSION	= "20150805.1";
 	
 	private class BatchOrderState
 	{
@@ -56,12 +58,13 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 		public Set<Instrument> SeriesProduct = null;
 		public long IsSimulation = 1;
 		public long Side = 1;
+		public long DelayTimeMS = 0;		// delay time between every orders
 		
 		public BatchOrderState()
 		{
 			OrderParam = new OrderParameters();
 			OrderParam.setAdditionalData(ORDERPARAM_ACCOUNT, "0000000");
-			OrderParam.setAdditionalData(ORDERPARAM_TRADERID, "070KV");	
+			OrderParam.setAdditionalData(ORDERPARAM_TRADERID, "070QAA");	
 		}
 		
 		public String toString()
@@ -119,17 +122,19 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 	}
 
 	public void onCreate() {
+		Strategy strategy = runtime.getStrategy();
 		
 		try
-		{
+		{			
 			java.util.Date crtDate = new java.util.Date();
 			java.text.SimpleDateFormat dateFormat = new java.text.SimpleDateFormat();
 			dateFormat.applyPattern("yyyyMMdd_HHmmss");
-			String logName = "/etc/orc/liquidator01/justin/strategy/Justin_LatencyBatchOrder_" + dateFormat.format(crtDate) + ".txt";
+			String logName = "/orcreleases/logs/Justin_LatencyBatchOrder_" + dateFormat.format(crtDate) + ".txt";
 			
 			fLog = new FileLog( logName );
 			LogSystem.getInstance().AttachLog(fLog);
 			fLog.WriteLog("Log start ... >>>> ");
+			fLog.WriteLog("Version:" + VERSION );
 		}
 		catch( Exception exp )
 		{
@@ -137,7 +142,6 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 			runtime.log("Craete and set log failed");
 		}
 		
-		Strategy strategy = runtime.getStrategy();
 		// get parameters
 		BatchOrderState state = new BatchOrderState();
 		state.Product = strategy.getInstrumentParameter(INSTRUMENT_PARAMETER);
@@ -304,7 +308,7 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 		
 		Strategy strategy = runtime.getStrategy();
 		BatchOrderState state = (BatchOrderState) strategy.getState();
-		long isActive = strategy.getLongParameter(ACTIVE_PARAMETER);
+		long isActive = strategy.getLongParameter(ACTIVE_PARAMETER);		
 		if( isActive > 0 && thread == null )
 		{
 			// start thread to send orders
@@ -424,6 +428,7 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 			long orderMode = strategy.getLongParameter(ORDERMODE_PARAMETER);
 			long isSimulation = strategy.getLongParameter(SIMULATION_PARAMETER);
 			long side = strategy.getLongParameter(SIDE_PARAMETER);
+			long delayTimeMS = strategy.getLongParameter(DELAY_PARAMETER);
 			String traderID = (String)strategy.getParameter(TRADERID_PARAMETER);
 
 			state.Price = price;
@@ -452,14 +457,14 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 				state.IsSimulation = isSimulation;
 			else
 			{
-				runtime.log("IsSimulation is incorrect.");
+				runtime.log("IsSimulation is incorrect.(1:Simulation,0:Order)");
 				strategy.setParameter(SIMULATION_PARAMETER, 1);
 			}
 			if( side >= 1 && side <= 2)
 				state.Side = side;
 			else
 			{
-				runtime.log("Side is incorrect.");
+				runtime.log("Side is incorrect.( Buy=>1, Sell=>2 )");
 				strategy.setParameter(SIDE_PARAMETER, state.Side);
 			}
 			if( traderID.length() > 0)
@@ -468,6 +473,10 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 			{
 				runtime.log("TraderID is incorrect.");
 				strategy.setParameter(TRADERID_PARAMETER, state.OrderParam.getAdditionalData(ORDERPARAM_TRADERID));
+			}
+			if( delayTimeMS >= 0 ){
+				state.DelayTimeMS = delayTimeMS;				
+				LogSystem.getInstance().WriteLog("Set DelayTimeMS = " + state.DelayTimeMS );
 			}
 			
 			LogSystem.getInstance().WriteLog("Update State," + state.toString());			
@@ -483,7 +492,7 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 		
 		try {
 			
-			LogSystem.getInstance().WriteLog("[Thread] start ...");
+			//LogSystem.getInstance().WriteLog("[Thread] start ...");
 			
 			if( orderSender.threadParam == null )
 			{
@@ -506,7 +515,7 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 				break;
 			}
 			
-			LogSystem.getInstance().WriteLog("[Thread] finished ...");
+			//LogSystem.getInstance().WriteLog("[Thread] finished ...");
 			
 			thread = null;			
 			strategy.setParameter(ACTIVE_PARAMETER, 0);
@@ -521,9 +530,10 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 		
 		//while (thread != null && !thread.isInterrupted()) {		 
 		try	{			
-			LogSystem.getInstance().WriteLog("$$>>,TestMode=Series,Status=Start");			
+			//LogSystem.getInstance().WriteLog("$$>>,TestMode=Series,Status=Start");
+			
 			for( Instrument orderProduct : state.SeriesProduct)
-			{					
+			{
 				double orderPrice = state.Price;
 				// Get limit price
 				if( dicLimit.containsKey(orderProduct.getFeedcode()) )
@@ -537,7 +547,7 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 				LogSystem.getInstance().WriteLog("Send order ID = " + orderID);
 				
 			}
-			LogSystem.getInstance().WriteLog("$$>>,TestMode=Series,Status=End");
+			//LogSystem.getInstance().WriteLog("$$>>,TestMode=Series,Status=End");
 		}
 		catch( Exception exp )
 		{
@@ -562,16 +572,19 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 
 			try
 			{	
-				LogSystem.getInstance().WriteLog("$$>>,TestMode=Batch,Status=Start");
+				boolean isSimulate = state.IsSimulation != 1;
 				long totalRun = state.BatchCount;
+				LogSystem.getInstance().WriteLog("$$>>,TestMode=Batch,Status=Start,IsSimulation=" + (isSimulate ? "Yes" : "No") + ",BatchCount=" + totalRun );				
 				for (int i = 0; i < totalRun; ++i) {
 
-					runtime.log("Order#" + i);
-					long orderID = SendOrder( om, state.Product, state.Lots, state.Price, state.IsSimulation != 1, state.Side, state.OrderParam);
+					//runtime.log("Order#" + i);
+					long orderID = SendOrder( om, state.Product, state.Lots, state.Price, isSimulate, state.Side, state.OrderParam);
 
-					runtime.log("Send order ID = " + orderID);
-					LogSystem.getInstance().WriteLog(
-							"Send order ID = " + orderID);				
+					//runtime.log("Send order ID = " + orderID);
+					//LogSystem.getInstance().WriteLog(
+					//		"Send order ID = " + orderID);	
+					if( state.DelayTimeMS > 0 )
+						Thread.sleep( state.DelayTimeMS ) ;
 					
 				}
 				LogSystem.getInstance().WriteLog("$$>>,TestMode=Batch,Status=End");
@@ -590,28 +603,29 @@ public class LatencyBatchOrder extends LiquidatorModule implements Runnable {
 	private long SendOrder(OrderManager om, Instrument product, long lots, double price, boolean isSimulation, long side, OrderParameters orderParam )
 	{
 		try {
-			String msg = "";						
+			//String msg = "";	
+			String msg = String.format( "SendOrder OrderBookID(%s),Lots(%d),Price(%f)", product.getFeedcode(), lots, price );
 			
 			long orderID = -1;
 			switch ((int)side) {
 			case OrderSide_Bid:
 				if (isSimulation)
 					orderID = om.bid(product, lots, price, orderParam);
-				msg = String.format(
-						"Send Order-Bid,Symbol=%s,Lots=%d,Price=%f",product.getFeedcode(), lots, price);
+				//msg = String.format(
+				//		"Send Order-Bid,Symbol=%s,Lots=%d,Price=%f",product.getFeedcode(), lots, price);
 				break;
 			case OrderSide_Ask:
 				if (isSimulation)
 					orderID = om.offer(product, lots, price, orderParam);
-				msg = String.format(
-						"Send Order-Ask,Symbol=%s,Lots=%d,Price=%f",product.getFeedcode(), lots, price);
+				//msg = String.format(
+				//		"Send Order-Ask,Symbol=%s,Lots=%d,Price=%f",product.getFeedcode(), lots, price);
 				break;
 			default:
 				runtime.log( "Unknown OrderSide=" + side);
 				break;
 			}
 			
-			runtime.log(msg);
+			//runtime.log(msg);
 			LogSystem.getInstance().WriteLog(msg);
 			
 			return orderID;
