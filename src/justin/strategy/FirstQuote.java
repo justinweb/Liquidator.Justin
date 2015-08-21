@@ -1,16 +1,21 @@
 package justin.strategy;
 
+import java.awt.List;
 import java.io.IOException;
-import java.util.Iterator;
-import java.util.Set;
+import java.lang.reflect.Array;
+import java.util.*;
 
 import com.orcsoftware.liquidator.Future;
 import com.orcsoftware.liquidator.Instrument;
 import com.orcsoftware.liquidator.InstrumentFilter;
 import com.orcsoftware.liquidator.InstrumentKind;
 import com.orcsoftware.liquidator.LiquidatorModule;
+import com.orcsoftware.liquidator.LiquidatorRuntime;
 import com.orcsoftware.liquidator.MarketData;
 import com.orcsoftware.liquidator.MassQuoteAck;
+import com.orcsoftware.liquidator.MassQuoteEntry;
+import com.orcsoftware.liquidator.MassQuotePackage;
+import com.orcsoftware.liquidator.MassQuoteRequest;
 import com.orcsoftware.liquidator.Option;
 import com.orcsoftware.liquidator.Order;
 import com.orcsoftware.liquidator.OrderParameters;
@@ -41,9 +46,16 @@ public class FirstQuote extends LiquidatorModule {
 	private static final String PARAM_BidQty	= "BidQty";
 	private static final String PARAM_TickDiff	= "TickDiff";
 	
-	private static final String VERSION	= "20150819.3";
+	private static final String VERSION	= "20150821.1";
 	
 	private FileLog fLog = null;
+	
+	public enum OrderModeEnum{
+		SingleOrder,
+		BatchOrder,
+		SingleQuote,
+		BatchQuote
+	}
 	
 	private class StatisticData{
 		public long Start_ns = 0;
@@ -60,6 +72,13 @@ public class FirstQuote extends LiquidatorModule {
 		public String ToString(){
 			return String.format("Start=%d,End=%d,Diff=%d", Start_ns, End_ns, Diff() );
 		}
+	}
+	
+	private class StatisticCalcResult{
+		public int Count = 0;
+		public double Average = 0.0;
+		public double Median = 0.0;
+		public double StdDev = 0.0;
 	}
 	
 	private class StatisticBatch{
@@ -88,9 +107,58 @@ public class FirstQuote extends LiquidatorModule {
 			}
 		}
 		
+		public StatisticCalcResult Calculate(){
+			StatisticCalcResult result = new StatisticCalcResult();
+			if( crtIndex <= 0 )
+				return result;
+			
+
+			
+			double totalDiff = 0.0;
+			int numOfData = 0;
+			for( StatisticData oneData : Data ){
+				totalDiff += oneData.Diff();
+				++numOfData;
+			}
+			result.Count = numOfData;
+			if( numOfData > 0 ){
+				double[] medianData = new double[numOfData];
+				int medianDataIndex = 0;
+				
+				result.Average = totalDiff / numOfData;
+				// calculate std. dev.
+				double totalDev = 0.0;
+				for( StatisticData oneData : Data ){
+					totalDev += (result.Average - oneData.Diff()) * (result.Average - oneData.Diff());
+					medianData[medianDataIndex++] = oneData.Diff();
+				}
+				result.StdDev = Math.sqrt( totalDev / numOfData );
+				
+				// calculate median
+				Arrays.sort( medianData );
+				if (medianData.length % 2 == 0) 
+			    {
+			       result.Median = (medianData[(medianData.length / 2) - 1] + medianData[medianData.length / 2]) / 2.0;
+			    } 
+			    else 
+			    {
+			       result.Median = medianData[medianData.length / 2];
+			    }
+			}
+			
+			return result;
+		}
+		
 		public int GatBatchCount() { return BatchCount; }
 		public int GetCrtIndex() { return crtIndex; }
 		public StatisticData[] GetData() { return Data; }
+	}
+	
+	private class MassQuoteData{
+		public long ID = 0;
+		public long StartTime_ns = 0;
+		public long EndTime_ns = 0;
+		public String Feedcode = "";
 	}
 	
 	private class FirstQuoteStatus
@@ -100,7 +168,7 @@ public class FirstQuote extends LiquidatorModule {
 		public double Price = 1.0;
 		public long BatchCount = 0;
 		public OrderParameters OrderParam = null;
-		public long OrderMode = 1;		
+		public long OrderMode = 3;		
 		public long IsSimulation = 1;
 		public long Side = 1;
 		public long DelayTimeMS = 0;		// delay time between every orders
@@ -108,7 +176,13 @@ public class FirstQuote extends LiquidatorModule {
 		public long BidQty = 0;
 		public double AskPrice = 0.0;
 		public double BidPrice = 0.0;
-		public double TickDiff = 0.0;		// tick price diff for adjust the bid and ask price for batch sending quotes
+		public double TickDiff = 0.0;		// tick price diff for adjust the bid and ask price for batch sending quotes		
+		
+		public Set<Instrument> BatchQuoteInstruments = new HashSet<Instrument>();
+		//public ArrayList BatchQuoteStartTime = new ArrayList();
+		//public Queue<Long> BatchQuoteStartTime = new LinkedList<Long>();
+		public Map<Long,MassQuoteData> BatchQuoteMQData = new HashMap<Long,MassQuoteData>();
+		public Set<MassQuotePackage> BatchQuote = new HashSet<MassQuotePackage>();
 		
 		public long StartSendQuote_ns = 0;
 		public long EndSendQuote_ns = 0;
@@ -190,6 +264,9 @@ public class FirstQuote extends LiquidatorModule {
 				
 				// show selected instrument
 				strategy.setParameter(SELSYMBOL_PARAMETER, state.Product.getFeedcode() );
+				
+				PrepareBatchQuoteInstruments( state.Product );
+				
 			}
 		}catch( Exception exp ){
 			runtime.log("FirstQuote", exp.toString());
@@ -234,7 +311,7 @@ public class FirstQuote extends LiquidatorModule {
 		// update parameters
 		GetParameters();
 		
-		ProductLimit limit = getProductLimit( state.Product );		
+		//ProductLimit limit = getProductLimit( state.Product );		
 	}
 	
 	public void onStop(){
@@ -258,11 +335,66 @@ public class FirstQuote extends LiquidatorModule {
 		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
 		long isActive = strategy.getLongParameter(ACTIVE_PARAMETER);		
 		if( isActive > 0 )
-		{
-			state.statisticBatch = new StatisticBatch( (int)state.BatchCount );
-			
-			SendQuote();
+		{			
+			switch( (int)state.OrderMode ){
+			case 0: // SingleOrder
+				break;
+			case 1: // BatchOrder
+				break;
+			case 2: // SingleQuote
+				state.statisticBatch = new StatisticBatch( (int)state.BatchCount );
+				SendQuote();
+				break;
+			case 3: // BatchQuote
+				state.statisticBatch = new StatisticBatch( state.BatchQuoteInstruments.size() );
+				state.BatchQuoteMQData.clear();
+				BatchQuote();
+				break;
+			default:
+				runtime.log("FirstQuote", "Unknown OrderMode=" + state.OrderMode );
+				break;
+			}
+
 		}	
+	}
+	
+	private void PrepareBatchQuoteInstruments( Instrument product ){
+//		String feedcode = product.getFeedcode();
+//		InstrumentKind myKind = product.getKind();
+//		if( myKind == InstrumentKind.CALL || myKind == InstrumentKind.PUT ){
+//			Option opt = (Option) product;
+//			double strike = opt.getStrikePrice();
+//		}
+		
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+		
+		String[] testFeedcode = new String[]{ "TXO06800I5", "TXO06900I5", "TXO07000I5" , "TXO07100I5", "TXO07200I5", "TXO07300I5", "TXO07400I5", "TXO07500I5", "TXO07600I5", "TXO07700I5" };
+		for( String feedcode : testFeedcode ){
+			Instrument newInst = runtime.getInstrumentManager().getInstrument( product.getMarketName(), feedcode );
+			if( newInst != null ){
+				runtime.log("FirstQuote", "Got Instrument=" + newInst.getFeedcode() );
+				
+				state.BatchQuoteInstruments.add( newInst );
+				
+			}else{
+				runtime.log(LiquidatorRuntime.LOG_WARNING, "FirstQtuoe", "Can not get instrument=" + feedcode );
+			}
+		}
+	}
+	
+	private void PrepareMassQuoteRequestEntry(){
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+		
+		state.BatchQuote.clear();
+		for( Instrument inst : state.BatchQuoteInstruments ){
+			MassQuotePackage mqPack = new MassQuotePackage();
+			MassQuoteEntry quoteEntry = new MassQuoteEntry( inst,state.BidQty, state.BidPrice, state.AskQty, state.AskPrice);
+			mqPack.addMassQuoteRequestEntry(quoteEntry);
+			
+			state.BatchQuote.add( mqPack );
+		}
 	}
 	
 	private ProductLimit getProductLimit( Instrument product )
@@ -335,7 +467,7 @@ public class FirstQuote extends LiquidatorModule {
 				runtime.log("BatchCount is incorrect.");
 				strategy.setParameter(BATCHCOUNT_PARAMETER, state.BatchCount);
 			}
-			if( orderMode >= 1 && orderMode <= 2)
+			if( orderMode >= 0 && orderMode <= 3)
 				state.OrderMode = orderMode;
 			else
 			{
@@ -393,16 +525,66 @@ public class FirstQuote extends LiquidatorModule {
 			LogSystem.getInstance().WriteLog("SendQuote ..." );
 			
 			Strategy strategy = runtime.getStrategy();
-			FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
-			
+			FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();			
 			
 			String msg;
-			msg = String.format( "SendQuote Symbol=%s,Bid=%d@%f,Ask=%d@%f", state.Product.getFeedcode(), state.BidQty, state.BidPrice, state.AskQty, state.AskPrice );
-			LogSystem.getInstance().WriteLog(msg);
+			msg = String.format( "SendQuote Symbol=%s,Bid=%d@%f,Ask=%d@%f", state.Product.getFeedcode(), state.BidQty, state.BidPrice, state.AskQty, state.AskPrice );			
+			LogSystem.getInstance().WriteLog(msg);						
+						
+			MassQuotePackage mqPack = new MassQuotePackage();
+			MassQuoteEntry quoteEntry = new MassQuoteEntry( state.Product,state.BidQty, state.BidPrice, state.AskQty, state.AskPrice);
+			mqPack.addMassQuoteRequestEntry(quoteEntry);
 			
-			state.StartSendQuote_ns = System.nanoTime();			
+			state.StartSendQuote_ns = System.nanoTime();
+			runtime.getOrderManager().massQuote((MassQuoteRequest)mqPack, state.OrderParam);
+			//runtime.getOrderManager().quote(state.Product, state.BidQty, state.BidPrice, state.AskQty, state.AskPrice, state.OrderParam );			
 			
-			runtime.getOrderManager().quote(state.Product, state.BidQty, state.BidPrice, state.AskQty, state.AskPrice, state.OrderParam );			
+			LogSystem.getInstance().WriteLog("SendQuote End" );
+		}catch( Exception exp ){
+			runtime.log(exp.toString());
+		}
+	}
+	
+	private void BatchQuote(){
+		try{
+			LogSystem.getInstance().WriteLog("BatchQuote ..." );
+			
+			Strategy strategy = runtime.getStrategy();
+			FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+			
+			String msg;
+//			for( Instrument inst : state.BatchQuoteInstruments ){			
+//				
+//				msg = String.format( "SendQuote Symbol=%s,Bid=%d@%f,Ask=%d@%f",inst.getFeedcode(), state.BidQty, state.BidPrice, state.AskQty, state.AskPrice );
+//				LogSystem.getInstance().WriteLog(msg);				
+//				
+//				MassQuoteData mqData = new MassQuoteData();
+//				mqData.Feedcode = inst.getFeedcode();
+//				mqData.StartTime_ns = System.nanoTime();
+//				
+//				MassQuotePackage mqPack = new MassQuotePackage();				
+//				MassQuoteEntry quoteEntry = new MassQuoteEntry( inst,state.BidQty, state.BidPrice, state.AskQty, state.AskPrice);
+//				mqPack.addMassQuoteRequestEntry(quoteEntry);
+//				mqData.ID = runtime.getOrderManager().massQuote((MassQuoteRequest)mqPack, state.OrderParam);
+//				
+//				state.BatchQuoteMQData.put( mqData.ID, mqData );
+//				//runtime.getOrderManager().quote(inst, state.BidQty, state.BidPrice, state.AskQty, state.AskPrice, state.OrderParam );			
+//			}
+			
+			PrepareMassQuoteRequestEntry();
+			
+			for( MassQuotePackage mqPack : state.BatchQuote ){				
+				
+				MassQuoteData mqData = new MassQuoteData();
+				mqData.Feedcode = mqPack.getMassQuoteRequestEntries()[0].getInstrument().getFeedcode();
+				mqData.StartTime_ns = System.nanoTime();
+				
+				mqData.ID = runtime.getOrderManager().massQuote((MassQuoteRequest)mqPack, state.OrderParam);
+				state.BatchQuoteMQData.put( mqData.ID, mqData );
+				
+				msg = String.format( "SendQuote Symbol=%s,Bid=%d@%f,Ask=%d@%f",mqData.Feedcode, state.BidQty, state.BidPrice, state.AskQty, state.AskPrice );
+				LogSystem.getInstance().WriteLog(msg);
+			}
 			
 			LogSystem.getInstance().WriteLog("SendQuote End" );
 		}catch( Exception exp ){
@@ -427,14 +609,54 @@ public class FirstQuote extends LiquidatorModule {
 			}
 			runtime.log("FirstQuote", removeQuoteLog );
 		}
+		
+		for( Instrument inst : state.BatchQuoteInstruments ){
+			quotepair = runtime.getOrderManager().getQuote( inst );
+			if (quotepair!=null) {
+				String removeQuoteLog = "Cancel " + inst.getFeedcode() + " ";
+				if (quotepair.getQuote(Side.SELL)!=null){
+					quotepair.getQuote(Side.SELL).remove();
+					removeQuoteLog += "Remove Sell side";
+				}
+				if (quotepair.getQuote(Side.BUY)!=null){
+					quotepair.getQuote(Side.BUY).remove();
+					removeQuoteLog += " " + "Remove Buy side";
+				}
+				runtime.log("FirstQuote", removeQuoteLog );
+			}
+		}
 	}
 	
+	// for FixOut
 	public void OnQuoteStatus(){
 		runtime.log( "FirstQuote", "OnQuoteStatus()..." );
 		
+		long timestamp = System.nanoTime();
 		Strategy strategy = runtime.getStrategy();
 		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
-		state.EndSendQuote_ns = System.nanoTime();
+		
+		switch( (int)state.OrderMode ){
+		case 0: // SingleOrder
+			break;
+		case 1: // BatchOrder
+			break;
+		case 2: // SingleQuote
+			OnQuoteStatusSingleQuote( timestamp );
+			break;
+		case 3: // BatchQuote
+			OnQuoteStatusBatchQuote( timestamp );
+			break;
+		default:
+			runtime.log(LiquidatorRuntime.LOG_WARNING, "FirstQuote", "Unknown OrderMode="+state.OrderMode);
+			break;
+		}
+	}
+	
+	private void OnQuoteStatusSingleQuote( long timestamp ){
+		
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+		state.EndSendQuote_ns = timestamp;
 		
 		runtime.log( "FirstQuote", String.format("Send Quote %d ns", state.EndSendQuote_ns - state.StartSendQuote_ns ) );
 		
@@ -447,33 +669,125 @@ public class FirstQuote extends LiquidatorModule {
 				state.AskPrice += state.TickDiff;
 				SendQuote();
 			}else{
-				runtime.log( "FirstQuote", "Batch Test is finished, count=" + state.BatchCount );
-				double totalDiff = 0;
-				long count = 0;
-				for( StatisticData data : state.statisticBatch.GetData() ){
-					totalDiff += data.Diff();
-					++count;
-					runtime.log( "FirstQuote", data.ToString() );
-				}
-				if( count > 0 ){
-					runtime.log( "FirstQuote", "Batch Test : avg " + totalDiff / count + " ns,count=" + count + ",TotalDiff=" + totalDiff );
-				}
+				ShowBatchTestResult();
+				strategy.setParameter(ACTIVE_PARAMETER, 0);
 			}
 		}
 	}
 	
-	public void onMassQuoteAck(MassQuoteAck massQuoteAck) {
-		runtime.log( "FirstQuote", "OMassQuoteAck()..." );
-		QuoteRejectInfo[] rejectInfo = massQuoteAck.getRejections();
-			if (rejectInfo == null || rejectInfo.length <= 0) {
-				runtime.log("Mass quote status [" + massQuoteAck.getMassQuoteAckType().toString() + "]");
-		    } else {
-		    	for (int i = 0; i < rejectInfo.length; i++) {
-		    		runtime.log("Error while sending massquote on instrument " + rejectInfo[i].getInstrument() + ". Error is:"
-		                     + rejectInfo[i].getErrorReason());
-		        }
-		    }
+	private void OnQuoteStatusBatchQuote( long timestamp ){
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+
+//		if( state.BatchQuoteStartTime.size() > 0 ){
+//			long timestampStart = state.BatchQuoteStartTime.remove();
+//			
+//			if( state.statisticBatch.AddData( new StatisticData( timestampStart, timestamp) ) == false ){
+//				runtime.log( "FirstQuote", "Add StatisticData failed" );
+//			}else{
+//				runtime.log( "FirstQuote", String.format( "CrtIndex=%d,BatchCount=%d", state.statisticBatch.GetCrtIndex(),state.statisticBatch.GatBatchCount() ));
+//				if( state.statisticBatch.GetCrtIndex() >= state.statisticBatch.GatBatchCount() ){
+//					ShowBatchTestResult();
+//				}
+//			}
+//		}		
+		
+	}
+	
+	private void ShowBatchTestResult(){
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+		
+		runtime.log( "FirstQuote", "Batch Test is finished, count=" + state.BatchCount );
+		
+		for( StatisticData oneData : state.statisticBatch.GetData() ){
+			runtime.log( "FirstQuote", String.format( "Start=%d,End=%d,Diff=%d", oneData.Start_ns, oneData.End_ns, oneData.Diff()) );
 		}
+		
+		StatisticCalcResult calcResult = state.statisticBatch.Calculate();
+		runtime.log( "FirstQuote", "Batch Test : avg " + calcResult.Average + " ns,count=" + calcResult.Count + ",Median=" + calcResult.Median + ",StdDev.=" + calcResult.StdDev );
+	}
+	
+	// For GDK Gateway MassQuote service
+	public void onMassQuoteAck(MassQuoteAck massQuoteAck) {
+		runtime.log( "FirstQuote", "OMassQuoteAck()...,ID=" + massQuoteAck.getMassQuoteIdentifier() );
+		long timestamp = System.nanoTime();
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+		
+		switch( (int)state.OrderMode ){
+		case 0: // SingleOrder
+			break;
+		case 1: // BatchOrder
+			break;
+		case 2: // SingleQuote
+			OnMassQuoteAckSingle( massQuoteAck, timestamp );
+			break;
+		case 3: // BatchQuote
+			OnMassQuoteAckBatch( massQuoteAck, timestamp );
+			break;
+		default:
+			runtime.log(LiquidatorRuntime.LOG_WARNING, "FirstQuote", "Unknown OrderMode="+state.OrderMode);
+			break;
+		}
+	}
+	
+	private void OnMassQuoteAckSingle(MassQuoteAck massQuoteAck, long endTime_ns ){
+		long mqID = massQuoteAck.getMassQuoteIdentifier();
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+			
+		runtime.log("FirstQuote", String.format("MQID=%d,Start=%d,End=%d", mqID, state.StartSendQuote_ns, endTime_ns) );
+		if( state.statisticBatch.AddData( new StatisticData( state.StartSendQuote_ns, endTime_ns ) ) == false ){
+			runtime.log(LiquidatorRuntime.LOG_ERROR, "FirstQuote", String.format("Add MQID=%d failed",mqID)  );
+		}else{
+			if( state.statisticBatch.GetCrtIndex() >= state.statisticBatch.GatBatchCount() ){
+				ShowBatchTestResult();
+				strategy.setParameter(ACTIVE_PARAMETER, 0);
+			}else{
+				state.BidPrice += state.TickDiff;
+				state.AskPrice += state.TickDiff;
+				
+				SendQuote();
+			}
+		}
+
+	}
+	
+	
+	private void OnMassQuoteAckBatch(MassQuoteAck massQuoteAck, long endTime_ns ){		
+		
+		QuoteRejectInfo[] rejectInfo = massQuoteAck.getRejections();
+		if (rejectInfo == null || rejectInfo.length <= 0) {
+			runtime.log("Mass quote status [" + massQuoteAck.getMassQuoteAckType().toString() + "]");
+	    } else {
+	    	for (int i = 0; i < rejectInfo.length; i++) {
+	    		runtime.log("Error while sending massquote on instrument " + rejectInfo[i].getInstrument() + ". Error is:"
+	                     + rejectInfo[i].getErrorReason());
+	        }
+	    }			
+		
+		long mqID = massQuoteAck.getMassQuoteIdentifier();
+		Strategy strategy = runtime.getStrategy();
+		FirstQuoteStatus state = (FirstQuoteStatus) strategy.getState();
+		MassQuoteData mqData = state.BatchQuoteMQData.get(mqID);
+		if( mqData != null ){
+			mqData.EndTime_ns = endTime_ns;
+			
+			runtime.log("FirstQuote", String.format("MQID=%d,Start=%d,End=%d", mqID, mqData.StartTime_ns, mqData.EndTime_ns) );
+			if( state.statisticBatch.AddData( new StatisticData( mqData.StartTime_ns, mqData.EndTime_ns) ) == false ){
+				runtime.log(LiquidatorRuntime.LOG_ERROR, "FirstQuote", String.format("Add MQID=%d failed",mqID)  );
+			}else{
+				if( state.statisticBatch.GetCrtIndex() >= state.statisticBatch.GatBatchCount() ){
+					ShowBatchTestResult();
+					strategy.setParameter(ACTIVE_PARAMETER, 0);
+				}
+			}
+		}
+
+	}
+	
+	
 
 
 }
